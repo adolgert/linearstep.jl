@@ -1,5 +1,5 @@
 module linearstep
 
-greet() = print("Hello World!")
+include("adam.jl")
 
 end # module
