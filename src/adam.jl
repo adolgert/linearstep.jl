@@ -304,10 +304,10 @@ function PxX_Adam!(vecX::CohortState, alpha, params)
 end
 
 
-function cohortXX_Adam(alpha, params; mx = 2620)
+function cohortXX_Adam(alpha, params; mx = 2920)
     # Grow a cohort so you can assign its stages to a population.
     vecX = emptyX_Adam()
-    XX = emptyXX_Adam(mx)
+    XX = emptyXX_Adam(L = mx)
     vecX.V = alpha / params[:mu1]
     for i in 1:mx
         XX.X[:, i] .= vecX.X
@@ -387,7 +387,7 @@ end
 
 
 function ar2stableWave_Adam(alpha, params; tol = 0.01)
-    cXX = cohortXX_Adam(alpha, params, 2920)
+    cXX = cohortXX_Adam(alpha, params)
     XX = cohort2ages_Adam(cXX, params)
     for i in 1:100
         PtimesX_Adam!(XX, alpha, params)
