@@ -618,7 +618,7 @@ pr2arSS_Adam <- function(x, par) {
   errFfast <- function(alpha) {
     (fastPfPR_Adam(alpha, par) - x)^2
   }
-  alpha0 <- optimize(errFfast, c(0, 1))$min
+  alpha0 <- optimize(errFgood, c(0, 1))$min
   # optimize(errFgood,c(alpha0/2,alpha0*2))$min
   return(alpha0)
 }

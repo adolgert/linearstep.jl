@@ -1,4 +1,4 @@
-import Base: copy, isapprox
+import Base: copy, isapprox, eltype
 using Distributions: Beta, cdf
 using LinearAlgebra
 using Optim
@@ -131,6 +131,17 @@ function xiF_inner(x; p_xi = 2, N = 9, C = 10, D = 0)
 end
 
 
+"""
+This is a fake version of xiF_inner so that we can test using
+ForwardDiff.
+"""
+function xiF_inner_norm(μ; p_xi = 0)
+    σ = .2
+    g(x) = (1 / (σ*sqrt(2 * π))) * exp(-0.5 * (x - μ)^2 / σ)
+    pts = g.((0:8) / 8)
+    pts / sum(pts)
+end
+
 # I can't tell whether V is an array or a single float when it gets used.
 # If it's an array, use pdf.() above, and it will work out.
 function xiF_h(pit, V ; p_xi1 = 5, p_xi2 = 1.5, N = 9, eps = 0.001)
@@ -139,7 +150,7 @@ function xiF_h(pit, V ; p_xi1 = 5, p_xi2 = 1.5, N = 9, eps = 0.001)
   else
       v = 1
   end
-  xi1 = xiF_inner(v, p_xi = p_xi1)
+  xi1 = xiF_inner_norm(v, p_xi = p_xi1)
   xi = xi1 .+ eps
   xi / sum(xi)
 end
@@ -239,21 +250,23 @@ end
 A single group. The code may use cohort/population in the opposite sense.
 I mean here that this is 22 compartments for one group of people.
 """
-mutable struct CohortState
-    X::Array{Float64,2}
-    pit::Array{Float64,1}
-    V::Float64
-    ageInDays::Float64
-    alpha1::Float64
-    alpha2::Float64
+mutable struct CohortState{T}
+    X::Array{T,2}
+    pit::Array{T,1}
+    V::T
+    ageInDays::T
+    alpha1::T
+    alpha2::T
 end
 
 
-function emptyX_Adam()
-    X = zeros(22, 1)
-    X[1] = 1
-    CohortState(X, zeros(3), 0, 0, 0, 0)
+function emptyX_Adam(T)
+    X = zeros(T, 22, 1)
+    X[1] = one(T)
+    CohortState{T}(X, zeros(T, 3), zero(T), zero(T), zero(T), zero(T))
 end
+
+eltype(chs::CohortState{T}) where {T} = T
 
 function isapprox(a::CohortState, b::CohortState)
     (a.alpha1 ≈ b.alpha1 && a.alpha2 ≈ b.alpha2 && a.V ≈ b.V) || return(false)
@@ -283,24 +296,25 @@ Multiple groups. There are 22 compartments for each of the
 groups. The code may use cohort to mean this and population to mean
 the CohortState, which I get, because this tracks multiple cohorts.
 """
-mutable struct PopulationState
-    X::Array{Float64,2}
-    pit::Array{Float64,2}
-    V::Float64
-    ageInDays::Array{Float64,2}
-    alpha1::Float64
-    alpha2::Float64
+mutable struct PopulationState{T}
+    X::Array{T,2}
+    pit::Array{T,2}
+    V::T
+    ageInDays::Array{T,2}
+    alpha1::T
+    alpha2::T
 end
 
 
-function emptyXX_Adam(; L = 66)
-    X = zeros(22, L)
-    X[1, :] .= 1
-    pit = zeros(3, L)
-    ageInDays = zeros(1, L)
-    PopulationState(X, pit, 0, ageInDays, 0, 0)
+function emptyXX_Adam(T; L = 66)
+    X = zeros(T, 22, L)
+    X[1, :] .= one(T)
+    pit = zeros(T, 3, L)
+    ageInDays = zeros(T, 1, L)
+    PopulationState{T}(X, pit, zero(T), ageInDays, zero(T), zero(T))
 end
 
+eltype(chs::PopulationState{T}) where {T} = T
 
 function isapprox(a::PopulationState, b::PopulationState)
     (a.alpha1 ≈ b.alpha1 && a.alpha2 ≈ b.alpha2 && a.V ≈ b.V) || return(false)
@@ -384,8 +398,8 @@ as a PopulationState.
 """
 function cohortXX_Adam(alpha, params; mx = 2920)
     # Grow a cohort so you can assign its stages to a population.
-    vecX = emptyX_Adam()
-    XX = emptyXX_Adam(L = mx)
+    vecX = emptyX_Adam(typeof(alpha))
+    XX = emptyXX_Adam(typeof(alpha), L = mx)
     vecX.V = alpha / params[:mu1]
     for i in 1:mx
         # An array column is size (22,) but an array with one column is (22,1)
@@ -405,7 +419,7 @@ function cohort2ages_Adam(cXX::PopulationState, params)
     ages = params[:ages]
     # ageInDays is a row vector. Easier to work with column here.
     ageInYears = vec(cXX.ageInDays / 365)
-    XX = emptyXX_Adam()
+    XX = emptyXX_Adam(eltype(cXX))
     XX.V = cXX.V
     XX.ageInDays = zeros(1, length(ages))
     no_ages = []
@@ -505,10 +519,12 @@ that would produce this PfPR for a population. This is an optimization
 step.
 """
 function pr2arSS_Adam(x, params)
-    objective = x -> (x - ar2pr_Adam(alpha, params))^2
+    # ForwardDiff.gradient(x -> ar2pr_Adam(x[1], params), [0.3])
+    objective = x -> (x[1] - ar2pr_Adam(alpha, params))^2
     lower = 0.0
     upper = 1.0
     res = optimize(objective, lower, upper)
+    # res = optimize(objective, [x], BFGS(); autodiff = :forward)
     Optim.minimizer(res), Optim.iterations(res), Optim.converged(res)
 end
 

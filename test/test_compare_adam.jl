@@ -1,3 +1,4 @@
+using BenchmarkTools
 using RCall
 
 R"setwd('~/.julia/packages/linearstep/src')"
@@ -54,7 +55,6 @@ function rtopopstate(rXX)
     if typeof(rage) <: Array
         ageInDays = convert(Array{Float64,2}, reshape(rage, 1, length(rage)))
     else
-        @show rage
         ageInDays = array_r_to_jl(rXXj[:ageInDays])
     end
     PopulationState(X, pit, V, ageInDays, rXXj[:alpha1], rXXj[:alpha2])
@@ -123,13 +123,13 @@ jd = xiF_inner(0)
 
 rxi = R"params$xiF(empty$pit, empty$V)"
 rxij = array_r_to_jl(rxi)
-vecX = emptyX_Adam()
+vecX = emptyX_Adam(Float64)
 jxi = params[:xiF](vecX.pit, vecX.V)
 @test jxi ≈ rxij
 
 
 ## calP_Adam
-vecX = emptyX_Adam()
+vecX = emptyX_Adam(Float64)
 calP = calP_Adam(alpha, vecX.pit, vecX.V, params)
 reval("vecX = emptyX_Adam()")
 rcalP = R"calP_Adam($(alpha), vecX$pit, vecX$V, params)"
@@ -140,7 +140,7 @@ rcalPj[isnan.(rcalPj)] .= 0
 
 
 ## emtpyXX_Adam
-cXX = emptyXX_Adam(L=2920)
+cXX = emptyXX_Adam(Float64, L=2920)
 rXX = R"emptyXX_Adam(L=2920)"
 rXXj = rtopopstate(rXX)
 @test cXX ≈ rXXj
@@ -148,7 +148,7 @@ differences(cXX, rXXj)
 
 
 ## PxX_Adam tests
-vecX = emptyX_Adam()
+vecX = emptyX_Adam(Float64)
 PxX_Adam!(vecX, alpha, params)
 reval("vecX = emptyX_Adam()")
 rvecX = R"PxX_Adam(alpha, vecX, params)"
@@ -191,3 +191,11 @@ differences(XX, rXXj)
 pr1 = ar2pr_Adam(alpha, params)
 pr2 = R"ar2pr_Adam(alpha, params)"
 @test abs(pr1 - rcopy(pr2)) < 1e-5
+
+# @btime pr2arSS_Adam(pr1, params)
+# Using regular optimize.
+# 2.061 s (11923106 allocations: 2.26 GiB)
+# Adding autodiff.
+# 595.124 ms (3924797 allocations: 752.06 MiB)
+# @btime R"pr2arSS_Adam($(pr1), params)"
+# 264.642 s (103 allocations: 3.05 KiB)
