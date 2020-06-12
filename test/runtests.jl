@@ -1,6 +1,6 @@
 using linearstep
 using Test
 
-@testset "linearstep.jl" begin
-    # Write your own tests here.
-end
+
+@time @testset "linearstep.jl" begin include("test_adam.jl") end
+@time @testset "compare_adam.jl" begin include("test_compare_adam.jl") end

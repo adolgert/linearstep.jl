@@ -1,4 +1,9 @@
-using Distributions: Beta
+import Base: copy, isapprox
+using Distributions: Beta, cdf
+using LinearAlgebra
+using Optim
+using Statistics: mean
+
 
 function wXageF0(ages)
     1.5 .* ages ./ (2 .+ ages)
@@ -85,22 +90,12 @@ function calP_SoI(N, tau, nu, r)
   s = r .* (1 .- nu)
   v = r .* nu
   # Remain in state with probability s, go to next state probability v
-  PSoI = bandSparse(N, 0) .* s .+ bandSparse(N, -1) .* v
+  PSoI = bandSparse(N, 0) .* s .+ transpose(bandSparse(N, 1) .* v)
   PSoI = vcat(transpose(1 .- r), PSoI) # rbind
   PSoI = hcat(zeros(10), PSoI) # cbind
   # Uninfected remain uninfected.
   PSoI[1, 1] = 1
   PSoI
-end
-
-
-function test_calP_SoI()
-  # Both are length 9
-  nu = [0.50000000, 0.16666667, 0.14285714, 0.12500000, 0.11111111, 0.11111111,
-    0.11111111, 0.08333333, 0.00000000]
-  r = [1.0000000, 0.9900498, 0.9607894, 0.9607894, 0.9607894, 0.9607894,
-    0.9607894, 0.9607894, 0.9753099]
-  calP_SoI(9, 10, nu, r)
 end
 
 
@@ -115,18 +110,37 @@ function ageXimmune(ageInDays)
 end
 
 
+"""
+The original R:
+xiF_0 <- function(x, p.xi = 2, N = 9, C = 10, D = 0) {
+  diff(pbeta(c(0:N) / N, (1 - exp(-p.xi * x)) * C, exp(-p.xi * x) * C + D))
+}
+The beta distribution has the same density in both languages. I checked.
+"""
 function xiF_inner(x; p_xi = 2, N = 9, C = 10, D = 0)
-    dist = Beta((1 - exp(-p_xi * x)) * C, exp(-p_xi * x) * C + D)
-    pdf(dist, x)
+    if (x > 0)
+        α = (1 - exp(-p_xi * x)) * C
+        β = exp(-p_xi * x) * C + D
+        dist = Beta(α, β)
+        diff(cdf.(dist, collect(0:N) / N))
+    else
+        bins = zeros(N)
+        bins[1] = 1
+        bins
+    end
 end
 
 
 # I can't tell whether V is an array or a single float when it gets used.
 # If it's an array, use pdf.() above, and it will work out.
-function xiF_h(pit, V ; p_xi1 = 5, p_xi2 = 2.5, N = 9, eps = 0.001)
-  v = 1 - exp(-(pit[2] + p_xi2 * pit[3]) / V)
+function xiF_h(pit, V ; p_xi1 = 5, p_xi2 = 1.5, N = 9, eps = 0.001)
+  if V > 0
+      v = 1 - exp(-(pit[2] + p_xi2 * pit[3]) / V)
+  else
+      v = 1
+  end
   xi1 = xiF_inner(v, p_xi = p_xi1)
-  xi = xi1 + eps
+  xi = xi1 .+ eps
   xi / sum(xi)
 end
 
@@ -183,7 +197,7 @@ function make_parameters_adam()
     Dict{Symbol,Any}(
       :tau => tau,
       :N => N,
-      :calDtrue => vcat(calDtrue_SoI, collect(1:10), [0, 0]),
+      :calDtrue => vcat(calDtrue_SoI, ones(10), [0, 0]),
       :calDlm => vcat(calDlm_SoI, calDlm_SoI, [0, 0]),
       :calDimm => vcat(calDimm_SoI, calDimm_SoI, [0, 0]),
       :calBfever => calBfever,
@@ -221,6 +235,10 @@ end
 
 ### Now we make the Adam model from those parameters
 
+"""
+A single group. The code may use cohort/population in the opposite sense.
+I mean here that this is 22 compartments for one group of people.
+"""
 mutable struct CohortState
     X::Array{Float64,2}
     pit::Array{Float64,1}
@@ -237,12 +255,39 @@ function emptyX_Adam()
     CohortState(X, zeros(3), 0, 0, 0, 0)
 end
 
+function isapprox(a::CohortState, b::CohortState)
+    (a.alpha1 ≈ b.alpha1 && a.alpha2 ≈ b.alpha2 && a.V ≈ b.V) || return(false)
+    a.X ≈ b.X || return(false)
+    a.pit ≈ b.pit || return(false)
+    a.ageInDays ≈ b.ageInDays || return(false)
+    true
+end
 
+
+"""
+This tells me where they differ.
+"""
+function differences(a::CohortState, b::CohortState)
+    msg = String[]
+    a.alpha1 ≈ b.alpha1 || push!(msg, "alpha1")
+    a.alpha2 ≈ b.alpha2 || push!(msg, "alpha2")
+    a.V ≈ b.V || push!(msg, "V")
+    a.X ≈ b.X || push!(msg, "X")
+    a.pit ≈ b.pit || push!(msg, "pit")
+    a.ageInDays ≈ b.ageInDays || push!(msg, "ageInDays")
+    msg
+end
+
+"""
+Multiple groups. There are 22 compartments for each of the
+groups. The code may use cohort to mean this and population to mean
+the CohortState, which I get, because this tracks multiple cohorts.
+"""
 mutable struct PopulationState
     X::Array{Float64,2}
     pit::Array{Float64,2}
     V::Float64
-    ageInDays::Array{Float64,1}
+    ageInDays::Array{Float64,2}
     alpha1::Float64
     alpha2::Float64
 end
@@ -252,8 +297,32 @@ function emptyXX_Adam(; L = 66)
     X = zeros(22, L)
     X[1, :] .= 1
     pit = zeros(3, L)
-    ageInDays = zeros(L)
+    ageInDays = zeros(1, L)
     PopulationState(X, pit, 0, ageInDays, 0, 0)
+end
+
+
+function isapprox(a::PopulationState, b::PopulationState)
+    (a.alpha1 ≈ b.alpha1 && a.alpha2 ≈ b.alpha2 && a.V ≈ b.V) || return(false)
+    a.X ≈ b.X || return(false)
+    a.pit ≈ b.pit || return(false)
+    a.ageInDays ≈ b.ageInDays || return(false)
+    true
+end
+
+
+"""
+This tells me where they differ.
+"""
+function differences(a::PopulationState, b::PopulationState)
+    msg = String[]
+    a.alpha1 ≈ b.alpha1 || push!(msg, "alpha1")
+    a.alpha2 ≈ b.alpha2 || push!(msg, "alpha2")
+    a.V ≈ b.V || push!(msg, "V")
+    a.X ≈ b.X || push!(msg, "X")
+    a.pit ≈ b.pit || push!(msg, "pit")
+    a.ageInDays ≈ b.ageInDays || push!(msg, "ageInDays")
+    msg
 end
 
 
@@ -262,57 +331,67 @@ Acts on members of the cohort state.
 """
 function calP_Adam(alpha, pit, V, params)
     SuS = params[:SuS]
-    PoI = params[:PoI]
-    alpha = minimum(alpha, 1)
+    PSoI = params[:PSoI]
+    alpha = min(alpha, 1)
     xi = params[:xiF](pit, V)
-    E1 = SuS * vcat(0, xi)
+    E1 = SuS .* vcat(0, xi)  # multiply each column
     e1 = sum(E1; dims=(1,))
-    e1[e1 == 0] .= 1
-    hatxi = E1 * Diagonal(1 ./ e1)
-    Deta = minimum.(rho * etaXstage .* rhoXstage, 1)
-    vecD = Deta .+ (1 .- Deta) .* Dd
+    e1[isapprox.(e1, 0)] .= 1
+    hatxi = E1 * ((1 ./ e1) .* I(10))
+    Deta = min.(params[:rho] * params[:etaXstage] .* params[:rhoXstage], 1)
+    vecD = Deta .+ (1 .- Deta) .* params[:Dd]
     notTreat = Diagonal(1 .- vecD)
     treat = vcat(vecD, vecD)
     B1 = PSoI * notTreat
+    @assert size(B1) == (10, 10)
     B2 = hatxi * notTreat
+    @assert size(B2) == (10, 10)
     chi = vcat([1], cumsum(xi))
-    calP = hcat(
-        vcat((1 .- alpha .* chi) .* B1, (1 -alpha) .* B2),
-        vcat(alpha * chi .* B1, alpha * B2),
-        treat,
-        0 * treat
+    calP = vcat(
+        hcat((1 .- alpha .* chi) .* B1, (1 -alpha) .* B2),
+        hcat(alpha * chi .* B1, alpha * B2),
+        transpose(treat),
+        transpose(0 * treat)
     )
-    calP = vcat(calP, zeros(dims(calP)[1], 2))
+    calP = hcat(calP, zeros(size(calP)[1], 2))
     calP[22, 21] = 1
     calP[1, 22] = 1
+    @assert size(calP) == (22, 22)
     calP
 end
 
 
 function PxX_Adam!(vecX::CohortState, alpha, params)
     vecX.ageInDays += params[:tau]
-    w = params[:wF](ageInDays / 365)
-    Xt = calP_Adam(w * vecX.alpha, vecX.pit, vecX.V, params) * vecX.X
+    w = params[:wF](vecX.ageInDays / 365)
+    Xt = calP_Adam(w * alpha, vecX.pit, vecX.V, params) * vecX.X
 
     vecX.V = alpha + vecX.V * (1 - params[:mu1])
     vecX.pit[1] = vecX.pit[1] * (1 - params[:mu1]) + vecX.alpha2
-    vecX.pit[2] = vecX.pit[2] * (1 - params[:mu2]) + params[:calDimm] * vecX.X
-    vecX.pit[3] = vecX.pit[3] * (1 - params[:mu3]) + vecX.alpha2 * params[:ageXimmune](vecX.ageInDays)
+    vecX.pit[2] = (vecX.pit[2] * (1 - params[:mu2]) +
+            dot(params[:calDimm],  vecX.X))
+    vecX.pit[3] = (vecX.pit[3] * (1 - params[:mu3]) +
+            vecX.alpha2 * params[:ageXimmune](vecX.ageInDays))
     vecX.alpha2 = vecX.alpha1
     vecX.alpha1 = w * alpha
     vecX.X = Xt
 end
 
 
+"""
+Simulates a cohort from birth over mx time steps and returns it
+as a PopulationState.
+"""
 function cohortXX_Adam(alpha, params; mx = 2920)
     # Grow a cohort so you can assign its stages to a population.
     vecX = emptyX_Adam()
     XX = emptyXX_Adam(L = mx)
     vecX.V = alpha / params[:mu1]
     for i in 1:mx
-        XX.X[:, i] .= vecX.X
-        XX.pit[:, i] = vecX.pit
-        XX.ageInDays[i] = vecX.ageInDays
+        # An array column is size (22,) but an array with one column is (22,1)
+        XX.X[:, i] .= vecX.X[:, 1]
+        XX.pit[:, i] = vecX.pit[:, 1]
+        XX.ageInDays[1, i] = vecX.ageInDays
         PxX_Adam!(vecX, alpha, params)
     end
     XX.alpha2 = vecX.alpha2
@@ -323,39 +402,44 @@ end
 
 
 function cohort2ages_Adam(cXX::PopulationState, params)
-    aa = params[:tau] * collect(1:size(cXX.X)[2]) / 365
+    ages = params[:ages]
+    # ageInDays is a row vector. Easier to work with column here.
+    ageInYears = vec(cXX.ageInDays / 365)
     XX = emptyXX_Adam()
     XX.V = cXX.V
-    XX.ageInDays = zeros(66)
-    ix = (aa .< params[:ages][1])
-    if length(ix) == 1
-        XX.X[:, 1] .= cXX.X[:, ix]
-        XX.pit[:, 1] = cXX.pit[:, ix]
-        XX.ageInDays[1] = cXX.ageInDays[ix]
-    else  # length(ix) > 1
-        XX.X[:, 1] .= sum(cXX.X[:, ix], dims = 1) / length(ix)
-        XX.pit[:, 1] .= sum(cXX.pit[:, ix], dims = 1) / length(ix)
-        XX.ageInDays[1] = mean(cXX.ageInDays[ix])
-    end
-
-    for i in 2:length(ages)
-        ix = (aa .> ages[i - 1]) & (aa .< ages[i])
-        if length(ix) == 1
-            XX.X[:, i] = cXX.X[:, ix]
-            XX.pit[:, i] = cXX.pit[:, ix]
-            XX.ageInDays[i] = cXX.ageInDays[ix]
+    XX.ageInDays = zeros(1, length(ages))
+    no_ages = []
+    lower = 0.0
+    for i in 1:length(ages)
+        upper = ages[i]
+        ix = (ageInYears .>= lower) .& (ageInYears .< upper)
+        age_cnt = sum(ix)
+        if age_cnt > 0
+            XX.X[:, i] = sum(cXX.X[:, ix], dims = 2) / age_cnt
+            XX.pit[:, i] = sum(cXX.pit[:, ix], dims = 2) / age_cnt
+            XX.ageInDays[1, i] = mean(cXX.ageInDays[ix])
         else
-            XX.X[:, i] = sum(cXX.X[:, ix], dims = 1) / length(ix)
-            XX.pit[:, i] = sum(cXX.pit[:, ix], dims = 1) / length(ix)
-            XX.ageInDays[i] = cXX.ageInDays[ix]
+            push!(no_ages, ages[i])
         end
+        lower = upper
+    end
+    if length(no_ages) > 0
+        println("no ages for $no_ages")
+        @assert length(no_ages) == 0
     end
     XX
 end
 
 
+function test_cohort2ages_Adam()
+    params = make_parameters_adam()
+    XX = cohortXX_Adam(0.3, params)
+    cohort2ages_Adam(XX, params)
+end
+
+
 function PtimesX_Adam!(XX::PopulationState, alpha, params)
-    ageInDays = (XX.ageInDays + params[:tau]) * params[:calO]
+    ageInDays = XX.ageInDays .+ params[:tau] * params[:calO]
     Xt = copy(XX.X)
     for a in 1:66
         Xt[:, a] .= calP_Adam(
@@ -369,12 +453,13 @@ function PtimesX_Adam!(XX::PopulationState, alpha, params)
     Xt[1, 1] = 1
 
     XX.V = alpha + XX.V * (1 - params[:mu1])
-    XX.pit[1] = XX.pit[1] * (1 - params[:mu1]) + alpha
-    XX.pit[2] = XX.pit[2] * (1 - params[:mu2]) + params[:calDimm] * XX.X
-    XX.pit[3] = XX.pit[3] * (1 - params[:mu3]) + XX.alpha2 * params[:aXi]
+    XX.pit[1, :] .= XX.pit[1, :] * (1 - params[:mu1]) .+ alpha
+    XX.pit[2, :] .= (XX.pit[2, :] * (1 - params[:mu2]) .+
+            transpose(XX.X) * params[:calDimm])
+    XX.pit[3, :] .= XX.pit[3, :] * (1 - params[:mu3]) .+ XX.alpha2 * params[:aXi]
 
     XX.pit *= params[:calO]
-    XX.ageInDays *= params[:calO]
+    XX.ageInDays = XX.ageInDays * params[:calO]
     XX.alpha2 = XX.alpha1
     XX.alpha1 = alpha
     XX.X = Xt
@@ -382,7 +467,7 @@ end
 
 
 function XX2pr29_Adam(XX, params)
-    params[:calDlm] * XX.X * params[:demog29]
+    transpose(params[:calDlm]) * XX.X * params[:demog29]
 end
 
 
@@ -395,25 +480,22 @@ function ar2stableWave_Adam(alpha, params; tol = 0.01)
     x = XX2pr29_Adam(XX, params)
     df = 1
     while df > tol
-        XXl = copy(XX)
+        original = copy(XX.X)
         PtimesX_Adam!(XX, alpha, params)
         x = XX2pr29_Adam(XX, params)
-        df = sum(abs(XXl$X - XX$X))
+        df = sum(abs.(original .- XX.X))
     end
     XX
 end
 
 
 function ar2pr_Adam(alpha, params)
-    XX = ar2stableWave_Adam(alpha[1], params)
+    XX = ar2stableWave_Adam(alpha, params)
     XX2pr29_Adam(XX, params)
 end
 
 
-function test_ar2pr_Adam()
-    params = make_parameters_adam()
-    ar2pr_Adam(0.3, params)
-end
+
 
 """
     pr2arSS_Adam(x, params)
@@ -423,7 +505,11 @@ that would produce this PfPR for a population. This is an optimization
 step.
 """
 function pr2arSS_Adam(x, params)
-    ## ar2pr_Adam
+    objective = x -> (x - ar2pr_Adam(alpha, params))^2
+    lower = 0.0
+    upper = 1.0
+    res = optimize(objective, lower, upper)
+    Optim.minimizer(res), Optim.iterations(res), Optim.converged(res)
 end
 
 
